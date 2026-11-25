@@ -1,0 +1,69 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: e9796567e904e3f409b019a5907c9403, type: 3}
+  m_Name: Level_01
+  m_EditorClassIdentifier: Assembly-CSharp::SandBlocks.Core.Data.LevelData
+  gameplayMode: 0
+  levelName: Level 1
+  particleRadius: 0.1708
+  characterScale: 0
+  verticalSpacingMultiplier: 0
+  maxParticles: 88
+  containerShape: 0
+  containerWidth: 4.29
+  containerHeight: 2.852
+  containerCenter: {x: 0, y: -1.5}
+  leftBorderOffset: 0
+  rightBorderOffset: 0
+  topBorderOffset: 0
+  bottomBorderOffset: 0
+  customPolygonPoints: []
+  patternType: 3
+  gridColumns: 9
+  gridRows: 8
+  customCrowdColors: 010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000060000000600000006000000060000000600000006000000060000000600000006000000060000000600000006000000060000000600000006000000060000000600000006000000070000000700000007000000070000000700000007000000070000000700000007000000070000000700000007000000070000000700000007000000070000000700000007000000
+  colorMapTexture: {fileID: 0}
+  puzzleColumns: 4
+  puzzleRows: 4
+  buses:
+  - name: Bus 1
+    colorId: 7
+    capacity: 18
+    length: 2
+    rotationDegrees: 0
+    gridPosition: {x: 1, y: 1}
+  - name: Bus 2
+    colorId: 1
+    capacity: 18
+    length: 2
+    rotationDegrees: 0
+    gridPosition: {x: 0, y: 2}
+  - name: Bus 3
+    colorId: 0
+    capacity: 18
+    length: 2
+    rotationDegrees: 0
+    gridPosition: {x: 2, y: 0}
+  - name: Bus 4
+    colorId: 6
+    capacity: 18
+    length: 2
+    rotationDegrees: 0
+    gridPosition: {x: 0, y: 0}
+  unifiedGridColumns: 8
+  unifiedGridRows: 8
+  unifiedGridRotation: 0
+  unifiedCellSize: 1.35
+  unifiedMode: 0
+  sharedDestinationPos: {x: 0, y: 0}
+  unifiedCells: []
+  unifiedBuses: []
