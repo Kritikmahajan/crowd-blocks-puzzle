@@ -1,0 +1,780 @@
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using SandBlocks.Core.Boundary;
+using SandBlocks.Core.Data;
+using SandBlocks.Core.Rendering;
+using SandBlocks.Core.Simulation;
+using SandBlocks.Puzzle.Grid;
+using SandBlocks.Puzzle.Input;
+using SandBlocks.Puzzle.Vehicles;
+
+namespace SandBlocks.Gameplay
+{
+    public class CrowdTransferController : MonoBehaviour
+    {
+        [Header("Components")]
+        [SerializeField] private PBDCrowdSimulation simulation;
+        [SerializeField] private ContainerBoundary boundary;
+        [SerializeField] private PuzzleGrid puzzleGrid;
+        [SerializeField] private VehicleDragHandler dragHandler;
+        [SerializeField] private InstancedCrowdRenderer crowdRenderer;
+        [SerializeField] private GameManager gameManager;
+        [SerializeField] private CrowdColorPalette palette;
+        [SerializeField] private GameObject commuterStreamPrefab;
+
+        [Header("Bus Animation Options")]
+        [Tooltip("Toggle the bus squash-and-stretch pop animation when a passenger fills into the bus")]
+        [SerializeField] private bool enableBusPopAnimation = true;
+
+        public bool EnableBusPopAnimation
+        {
+            get => enableBusPopAnimation;
+            set => enableBusPopAnimation = value;
+        }
+
+        [Header("Transfer Tuning")]
+        [SerializeField] private float transferInterval = 0.09f;
+        [SerializeField] private float flightDuration = 0.28f;
+        [Tooltip("Depth / range along Z-axis (in Horizontal_XZ) into the crowd that can be collected by buses at the collection line.")]
+        [Range(0.05f, 2.5f)]
+        [SerializeField] private float boundaryLayerTolerance = 0.7f;
+        [SerializeField] private float commuterScale = 0.08f;
+
+        [Header("Dynamic Stream Acceleration (Large Group Speed-up)")]
+        [Tooltip("Progressively accelerate crowd fill speed over time when a continuous group of crowd fills into a bus.")]
+        [SerializeField] private bool enableFillAcceleration = true;
+
+        [Tooltip("Initial launch interval in seconds when a stream starts.")]
+        [Range(0.04f, 0.25f)]
+        [SerializeField] private float baseTransferInterval = 0.10f;
+
+        [Tooltip("Fastest launch interval in seconds at maximum stream speed (capped for good visibility).")]
+        [Range(0.03f, 0.15f)]
+        [SerializeField] private float minTransferInterval = 0.052f;
+
+        [Tooltip("Initial flight duration in seconds for commuters when a stream starts.")]
+        [Range(0.15f, 0.60f)]
+        [SerializeField] private float baseFlightDuration = 0.32f;
+
+        [Tooltip("Fastest flight duration in seconds at maximum stream speed (capped for clear jump arc visibility).")]
+        [Range(0.12f, 0.45f)]
+        [SerializeField] private float minFlightDuration = 0.20f;
+
+        [Tooltip("Number of consecutive passengers required to reach maximum fill speed.")]
+        [Range(3, 30)]
+        [SerializeField] private int accelerationRampTransfers = 12;
+
+        [Tooltip("Time in seconds without transfers before the stream acceleration resets back to initial baseline speed.")]
+        [Range(0.1f, 1.0f)]
+        [SerializeField] private float streamResetGracePeriod = 0.35f;
+
+        public bool EnableFillAcceleration { get => enableFillAcceleration; set => enableFillAcceleration = value; }
+        public float BaseTransferInterval { get => baseTransferInterval; set => baseTransferInterval = value; }
+        public float MinTransferInterval { get => minTransferInterval; set => minTransferInterval = value; }
+        public float BaseFlightDuration { get => baseFlightDuration; set => baseFlightDuration = value; }
+        public float MinFlightDuration { get => minFlightDuration; set => minFlightDuration = value; }
+        public int AccelerationRampTransfers { get => accelerationRampTransfers; set => accelerationRampTransfers = value; }
+
+        [Header("Jump Flight Arc & Camera Visibility")]
+        [Tooltip("Vertical height added to the jump flight trajectory curve")]
+        [SerializeField] private float jumpArcHeight = 2.4f;
+        [Tooltip("Forward offset (-Z toward camera) added to flight midpoint so character stays in prominent view")]
+        [SerializeField] private float jumpForwardBias = 0.75f;
+        [Tooltip("Maximum pitch angle (degrees) tilting feet forward toward camera during landing so whole character is visible from top-down camera")]
+        [SerializeField] private float landingFeetForwardTilt = 38f;
+
+        [Header("Gizmos & Debug")]
+        [Tooltip("Draw gizmo lines in the Scene View showing container floor and tolerance threshold line")]
+        [SerializeField] private bool showToleranceGizmo = true;
+        [Tooltip("If true, only draws gizmos when this GameObject is selected. If false, always draws in Scene View.")]
+        [SerializeField] private bool showGizmoOnlyWhenSelected = false;
+        [Tooltip("Vertical elevation offset above the container surface so gizmos and labels ride cleanly on top of characters")]
+        [SerializeField] private float gizmoElevationOffset = 0.03f;
+        [Tooltip("3D volume height for the tolerance and exception bands in Scene View")]
+        [SerializeField] private float gizmoVolumeHeight = 0.45f;
+
+        private float transferTimer;
+        private readonly List<GameObject> inFlightCommuters = new List<GameObject>();
+        private readonly List<GameObject> commuterPool = new List<GameObject>();
+        private readonly List<VehicleBase> cachedCandidates = new List<VehicleBase>(8);
+        private int consecutiveTransfers = 0;
+        private float lastTransferTime = -1f;
+        private VehicleBase lastCollectingBus = null;
+
+        /// <summary>
+        /// The number of commuters currently flying from the container crowd to the buses.
+        /// </summary>
+        public int InFlightCount => inFlightCommuters.Count;
+
+        /// <summary>
+        /// Current number of consecutive passengers transferred in the active stream.
+        /// </summary>
+        public int ConsecutiveTransfers => consecutiveTransfers;
+
+        public void SetCharacterScale(float scale)
+        {
+            commuterScale = scale;
+        }
+
+        private GameObject GetPooledCommuter(Vector3 pos, Quaternion rot, float scale, int colorId)
+        {
+            GameObject commuter = null;
+            for (int i = 0; i < commuterPool.Count; i++)
+            {
+                if (commuterPool[i] != null && !commuterPool[i].activeSelf)
+                {
+                    commuter = commuterPool[i];
+                    break;
+                }
+            }
+
+            if (commuter == null)
+            {
+                GameObject prefabToUse = commuterStreamPrefab != null ? commuterStreamPrefab : (lastCollectingBus is BusVehicle bv ? bv.PassengerPrefab : null);
+                if (prefabToUse != null)
+                {
+                    commuter = Instantiate(prefabToUse, pos, rot);
+                }
+                else
+                {
+                    commuter = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                    var col = commuter.GetComponent<Collider>();
+                    if (col != null) Destroy(col);
+                }
+                var cols = commuter.GetComponentsInChildren<Collider>(true);
+                for (int c = 0; c < cols.Length; c++) cols[c].enabled = false;
+
+                commuter.transform.SetParent(transform);
+                commuterPool.Add(commuter);
+            }
+
+            commuter.transform.position = pos;
+            commuter.transform.rotation = rot;
+            commuter.transform.localScale = Vector3.one * scale;
+            commuter.SetActive(true);
+
+            var charPassenger = commuter.GetComponent<CharacterPassenger>() ?? commuter.AddComponent<CharacterPassenger>();
+            charPassenger.PlayRunning();
+            if (palette != null)
+            {
+                charPassenger.SetColor(palette.GetColor(colorId));
+            }
+
+            return commuter;
+        }
+
+        private void ReturnPooledCommuter(GameObject commuter)
+        {
+            if (commuter != null)
+            {
+                commuter.SetActive(false);
+            }
+        }
+
+        public void ClearActiveTransfers()
+        {
+            StopAllCoroutines();
+            for (int i = 0; i < inFlightCommuters.Count; i++)
+            {
+                if (inFlightCommuters[i] != null)
+                {
+                    inFlightCommuters[i].SetActive(false);
+                }
+            }
+            inFlightCommuters.Clear();
+            consecutiveTransfers = 0;
+            lastCollectingBus = null;
+        }
+
+        public float GetActiveTransferInterval()
+        {
+            if (!enableFillAcceleration) return transferInterval;
+
+            float progress = Mathf.Clamp01((float)consecutiveTransfers / Mathf.Max(1, accelerationRampTransfers));
+            // SmoothStep provides gentle initial ramp and eases off at top speed so it doesn't overshoot
+            float smooth = Mathf.SmoothStep(0f, 1f, progress);
+            return Mathf.Lerp(baseTransferInterval, minTransferInterval, smooth);
+        }
+
+        public float GetActiveFlightDuration()
+        {
+            if (!enableFillAcceleration) return flightDuration;
+
+            float progress = Mathf.Clamp01((float)consecutiveTransfers / Mathf.Max(1, accelerationRampTransfers));
+            float smooth = Mathf.SmoothStep(0f, 1f, progress);
+            return Mathf.Lerp(baseFlightDuration, minFlightDuration, smooth);
+        }
+
+        private void RegisterSuccessfulTransfer(VehicleBase bus)
+        {
+            lastCollectingBus = bus;
+            consecutiveTransfers++;
+            lastTransferTime = Time.time;
+        }
+
+        private void Awake()
+        {
+            if (simulation == null) simulation = FindAnyObjectByType<PBDCrowdSimulation>();
+            if (boundary == null) boundary = FindAnyObjectByType<ContainerBoundary>();
+            if (puzzleGrid == null) puzzleGrid = FindAnyObjectByType<PuzzleGrid>();
+            if (dragHandler == null) dragHandler = FindAnyObjectByType<VehicleDragHandler>();
+            if (crowdRenderer == null) crowdRenderer = FindAnyObjectByType<InstancedCrowdRenderer>();
+            if (gameManager == null) gameManager = FindAnyObjectByType<GameManager>();
+            if (crowdRenderer != null) commuterScale = crowdRenderer.CharacterScale;
+        }
+
+        private void Update()
+        {
+            if (gameManager == null) gameManager = FindAnyObjectByType<GameManager>();
+            if (gameManager != null && (!gameManager.IsGameStarted || gameManager.IsLevelStartAnimating))
+            {
+                return;
+            }
+
+            if (enableFillAcceleration)
+            {
+                // Reset stream streak if no transfer has occurred within grace period
+                if (consecutiveTransfers > 0 && Time.time - lastTransferTime > streamResetGracePeriod)
+                {
+                    consecutiveTransfers = 0;
+                    lastCollectingBus = null;
+                }
+            }
+
+            float activeInterval = GetActiveTransferInterval();
+            transferTimer += Time.deltaTime;
+            if (transferTimer >= activeInterval)
+            {
+                transferTimer = 0f;
+                ProcessTransfer();
+            }
+        }
+
+        private void ProcessTransfer()
+        {
+            if (simulation == null || boundary == null) return;
+
+            var candidates = GetActiveBusesAtTopOfGrid();
+            if (candidates == null || candidates.Count == 0) return;
+
+            float bottomY = boundary.BottomY;
+
+            float effectiveTolerance = Mathf.Max(boundaryLayerTolerance, 0.02f);
+
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                var bus = candidates[i];
+                if (bus == null || bus.IsFull) continue;
+                if (bus is BusVehicle bv && bv.IsDrivingAway) continue;
+
+                if (!TryGetBusCollectionRange(bus, out float minX, out float maxX))
+                {
+                    continue;
+                }
+
+                // Only extract if people of this bus's color are currently ON THE BOTTOM BOUNDARY LINE
+                // and strictly within this bus's column percentage slice [minX, maxX]
+                if (!simulation.HasColorOnBottomBoundary(bus.ColorId, bottomY, minX, maxX, effectiveTolerance))
+                {
+                    continue;
+                }
+
+                // Extract matching person within [minX, maxX] closest to bus center of this column slice
+                float sliceCenterX = (minX + maxX) * 0.5f;
+                if (simulation.TryExtractBottomParticle(bus.ColorId, bottomY, minX, maxX, sliceCenterX, out Vector3 startPos, effectiveTolerance))
+                {
+                    if (bus is BusVehicle busVehicle)
+                    {
+                        if (busVehicle.TryReserveSeat(out Vector3 seatPos))
+                        {
+                            RegisterSuccessfulTransfer(bus);
+                            StartCoroutine(AnimateCommuterFlight(startPos, busVehicle, seatPos, bus.ColorId, GetActiveFlightDuration()));
+                        }
+                    }
+                    else
+                    {
+                        if (bus.TryAddPassenger(out Vector3 seatPos))
+                        {
+                            RegisterSuccessfulTransfer(bus);
+                            StartCoroutine(AnimateCommuterFlightLegacy(startPos, bus, seatPos, bus.ColorId, GetActiveFlightDuration()));
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Calculates the horizontal percentage of the crowd area covered by the bus based on its grid columns.
+        /// A horizontal bus covering columns [colMin, colMax] covers [colMin/totalCols, (colMax+1)/totalCols].
+        /// A vertical bus covering 1 column covers [col/totalCols, (col+1)/totalCols].
+        /// </summary>
+        public bool TryGetBusCollectionRange(VehicleBase bus, out float minX, out float maxX)
+        {
+            minX = 0f;
+            maxX = 0f;
+            if (bus == null) return false;
+
+            if (puzzleGrid == null) puzzleGrid = FindAnyObjectByType<PuzzleGrid>();
+            if (boundary == null) boundary = FindAnyObjectByType<ContainerBoundary>();
+            if (puzzleGrid == null || boundary == null) return false;
+
+            int totalCols = puzzleGrid.Columns > 0 ? puzzleGrid.Columns : 6;
+            int topRow = puzzleGrid.Rows - 1;
+
+            // Determine occupied columns on the puzzle grid at the collection row
+            Vector2Int anchorGrid = bus.GridPosition;
+            if (dragHandler != null && dragHandler.IsDragging && dragHandler.HoveredVehicle == bus)
+            {
+                anchorGrid = dragHandler.CurrentHoveredGrid;
+            }
+
+            var occCells = bus.GetOccupiedCells(anchorGrid);
+            bool touchesTopRow = false;
+            int colMin = int.MaxValue;
+            int colMax = int.MinValue;
+
+            for (int i = 0; i < occCells.Count; i++)
+            {
+                if (occCells[i].y == topRow)
+                {
+                    touchesTopRow = true;
+                }
+                if (occCells[i].x < colMin) colMin = occCells[i].x;
+                if (occCells[i].x > colMax) colMax = occCells[i].x;
+            }
+
+            // Must have at least one cell on topRow to have a valid collection range
+            if (!touchesTopRow || colMin > colMax)
+            {
+                return false;
+            }
+
+            colMin = Mathf.Clamp(colMin, 0, totalCols - 1);
+            colMax = Mathf.Clamp(colMax, 0, totalCols - 1);
+
+            // Calculate percentage across the puzzle width [0.0, 1.0] strictly matching this bus's occupied width
+            float minPct = (float)colMin / totalCols;
+            float maxPct = (float)(colMax + 1) / totalCols;
+
+            // Map percentage to crowd container horizontal span
+            Rect bounds = boundary.Bounds;
+            float crowdLeft = bounds.xMin;
+            float crowdWidth = bounds.width;
+
+            minX = crowdLeft + minPct * crowdWidth;
+            maxX = crowdLeft + maxPct * crowdWidth;
+
+            // Safe column-proportional edge tolerance buffer (clamps to at most 15% of column span)
+            float colSpan = crowdWidth / totalCols;
+            float toleranceBuffer = Mathf.Min(0.20f, colSpan * 0.15f);
+            minX -= toleranceBuffer;
+            maxX += toleranceBuffer;
+
+            return true;
+        }
+
+        private List<VehicleBase> GetActiveBusesAtTopOfGrid()
+        {
+            if (puzzleGrid == null) puzzleGrid = FindAnyObjectByType<PuzzleGrid>();
+            if (boundary == null) boundary = FindAnyObjectByType<ContainerBoundary>();
+            if (dragHandler == null) dragHandler = FindAnyObjectByType<VehicleDragHandler>();
+
+            cachedCandidates.Clear();
+            var candidates = cachedCandidates;
+
+            // 1. Actively hovered/dragged bus has TOP PRIORITY for collection!
+            if (dragHandler != null && dragHandler.IsDragging)
+            {
+                var dragged = dragHandler.HoveredVehicle;
+                if (dragged != null && !dragged.IsFull && !(dragged is BusVehicle dbv && dbv.IsDrivingAway) && IsVehicleInCollectionZone(dragged))
+                {
+                    candidates.Add(dragged);
+                }
+            }
+
+            // 2. Placed vehicles at the top row of the puzzle grid
+            if (puzzleGrid != null)
+            {
+                int topRow = puzzleGrid.Rows - 1;
+                for (int x = 0; x < puzzleGrid.Columns; x++)
+                {
+                    var v = puzzleGrid.GetVehicleAt(x, topRow);
+                    if (v != null && !v.IsFull && !(v is BusVehicle vbv && vbv.IsDrivingAway))
+                    {
+                        // Ignore vehicle if it is currently being dragged (handled in section 1 by hover)
+                        if (dragHandler != null && dragHandler.IsDragging && dragHandler.HoveredVehicle == v)
+                            continue;
+
+                        if (!candidates.Contains(v) && IsVehicleInCollectionZone(v))
+                        {
+                            candidates.Add(v);
+                        }
+                    }
+                }
+            }
+
+            return candidates;
+        }
+
+        private bool IsVehicleInCollectionZone(VehicleBase vehicle)
+        {
+            if (vehicle == null || vehicle.IsFull || (vehicle is BusVehicle bv && bv.IsDrivingAway)) return false;
+
+            if (puzzleGrid == null) puzzleGrid = FindAnyObjectByType<PuzzleGrid>();
+            if (boundary == null) boundary = FindAnyObjectByType<ContainerBoundary>();
+
+            int topRow = puzzleGrid != null ? puzzleGrid.Rows - 1 : 4;
+
+            // 0. Active dragging hover check: when user drags bus, its collection state matches its drag shadow/hover exclusively!
+            if (dragHandler != null && dragHandler.IsDragging && dragHandler.HoveredVehicle == vehicle)
+            {
+                var hCells = vehicle.GetOccupiedCells(dragHandler.CurrentHoveredGrid);
+                for (int i = 0; i < hCells.Count; i++)
+                {
+                    if (hCells[i].y == topRow) return true;
+                }
+                // When actively dragging, if the shadow/hover is not on the top row, DO NOT collect!
+                return false;
+            }
+
+            // 1. Placed vehicle check: check occupied cells at vehicle.GridPosition
+            var vCells = vehicle.GetOccupiedCells(vehicle.GridPosition);
+            for (int i = 0; i < vCells.Count; i++)
+            {
+                if (vCells[i].y == topRow) return true;
+            }
+
+            return false;
+        }
+
+        private IEnumerator AnimateCommuterFlight(Vector3 start, BusVehicle targetBus, Vector3 targetSeatPos, int colorId, float customDuration = -1f)
+        {
+            float activeFlightDuration = (customDuration > 0.01f) ? customDuration : GetActiveFlightDuration();
+            bool isHorizontal = (SandBlocks.Gameplay.GameManager.CurrentOrientation == SandBlocks.Core.Data.BoardOrientation.Horizontal_XZ);
+            float activeScale = crowdRenderer != null ? crowdRenderer.CharacterScale : commuterScale;
+            Vector3 baseRot = crowdRenderer != null ? crowdRenderer.CharacterRotationEuler : Vector3.zero;
+
+            GameObject commuter = GetPooledCommuter(start, Quaternion.Euler(baseRot), activeScale, colorId);
+            inFlightCommuters.Add(commuter);
+            var charPassenger = commuter.GetComponent<CharacterPassenger>();
+
+            try
+            {
+                // Calculate the seat's offset relative to the bus so it dynamically follows if bus is dragged
+                Vector3 localSeatOffset = (targetBus != null && targetSeatPos != Vector3.zero)
+                    ? targetBus.transform.InverseTransformPoint(targetSeatPos)
+                    : Vector3.zero;
+
+                Vector3 endPos = (targetBus != null) ? targetBus.transform.TransformPoint(localSeatOffset) : targetSeatPos;
+                float elapsed = 0f;
+
+                while (elapsed < activeFlightDuration)
+                {
+                    elapsed += Time.deltaTime;
+                    float t = Mathf.Clamp01(elapsed / activeFlightDuration);
+
+                    // Dynamically track the target bus as it moves / hovers
+                    if (targetBus != null)
+                    {
+                        endPos = targetBus.transform.TransformPoint(localSeatOffset);
+                    }
+
+                    Vector3 midPoint = isHorizontal
+                        ? (start + endPos) * 0.5f + Vector3.up * jumpArcHeight
+                        : (start + endPos) * 0.5f + Vector3.up * jumpArcHeight - Vector3.forward * jumpForwardBias;
+                    float oneMinusT = 1f - t;
+                    Vector3 currentPos = oneMinusT * oneMinusT * start + 2f * oneMinusT * t * midPoint + t * t * endPos;
+                    commuter.transform.position = currentPos;
+
+                    if (charPassenger != null)
+                    {
+                        charPassenger.ApplyJumpFlightTilt(t, landingFeetForwardTilt, baseRot);
+                    }
+                    yield return null;
+                }
+
+                // Enable pre-placed seat passenger on the bus
+                if (targetBus != null)
+                {
+                    bool prevPop = targetBus.EnablePassengerBoardPop;
+                    if (!enableBusPopAnimation) targetBus.EnablePassengerBoardPop = false;
+                    targetBus.BoardPassenger();
+                    if (!enableBusPopAnimation) targetBus.EnablePassengerBoardPop = prevPop;
+                }
+            }
+            finally
+            {
+                inFlightCommuters.Remove(commuter);
+                ReturnPooledCommuter(commuter);
+            }
+        }
+
+        private IEnumerator AnimateCommuterFlightLegacy(Vector3 start, VehicleBase targetBus, Vector3 localSeat, int colorId, float customDuration = -1f)
+        {
+            float activeFlightDuration = (customDuration > 0.01f) ? customDuration : GetActiveFlightDuration();
+            float activeScale = crowdRenderer != null ? crowdRenderer.CharacterScale : commuterScale;
+            Vector3 baseRot = crowdRenderer != null ? crowdRenderer.CharacterRotationEuler : Vector3.zero;
+
+            GameObject commuter;
+            if (commuterStreamPrefab != null)
+            {
+                commuter = Instantiate(commuterStreamPrefab, start, Quaternion.Euler(baseRot));
+                commuter.transform.localScale = Vector3.one * activeScale;
+                var charPassenger = commuter.GetComponent<CharacterPassenger>() ?? commuter.AddComponent<CharacterPassenger>();
+                charPassenger.PlayRunning();
+                var cols = commuter.GetComponentsInChildren<Collider>();
+                for (int c = 0; c < cols.Length; c++) cols[c].enabled = false;
+            }
+            else
+            {
+                commuter = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                commuter.transform.position = start;
+                commuter.transform.localScale = Vector3.one * 0.45f;
+                var col = commuter.GetComponent<Collider>();
+                if (col != null) Destroy(col);
+            }
+
+            if (palette != null)
+            {
+                Color c = palette.GetColor(colorId);
+                var rends = commuter.GetComponentsInChildren<Renderer>();
+                foreach (var r in rends)
+                {
+                    if (r == null) continue;
+                    r.material.color = c;
+                }
+            }
+
+            Vector3 endPos = targetBus != null ? targetBus.transform.TransformPoint(localSeat) : start;
+            bool isHorizontal = (SandBlocks.Gameplay.GameManager.CurrentOrientation == SandBlocks.Core.Data.BoardOrientation.Horizontal_XZ);
+            Vector3 midPoint = isHorizontal
+                ? (start + endPos) * 0.5f + Vector3.up * 1.4f
+                : (start + endPos) * 0.5f + Vector3.up * 1.4f - Vector3.forward * 0.5f;
+            float elapsed = 0f;
+
+            while (elapsed < activeFlightDuration)
+            {
+                elapsed += Time.deltaTime;
+                float t = Mathf.Clamp01(elapsed / activeFlightDuration);
+
+                if (targetBus != null)
+                {
+                    endPos = targetBus.transform.TransformPoint(localSeat);
+                }
+
+                float oneMinusT = 1f - t;
+                Vector3 currentPos = oneMinusT * oneMinusT * start + 2f * oneMinusT * t * midPoint + t * t * endPos;
+                commuter.transform.position = currentPos;
+                commuter.transform.rotation = Quaternion.Euler(baseRot);
+                yield return null;
+            }
+
+            Destroy(commuter);
+        }
+
+#if UNITY_EDITOR
+        private void OnDrawGizmos()
+        {
+            if (showToleranceGizmo && !showGizmoOnlyWhenSelected)
+            {
+                DrawToleranceGizmos();
+            }
+        }
+
+        private void OnDrawGizmosSelected()
+        {
+            if (showToleranceGizmo && showGizmoOnlyWhenSelected)
+            {
+                DrawToleranceGizmos();
+            }
+        }
+
+        private void DrawToleranceGizmos()
+        {
+            if (boundary == null) boundary = FindAnyObjectByType<ContainerBoundary>();
+            if (boundary == null) return;
+
+            bool isHorizontal = (SandBlocks.Gameplay.GameManager.CurrentOrientation == SandBlocks.Core.Data.BoardOrientation.Horizontal_XZ);
+            float bottomY = boundary.BottomY;
+            float thresholdY = bottomY + boundaryLayerTolerance;
+            Rect bounds = boundary.Bounds;
+            float leftX = bounds.xMin;
+            float rightX = bounds.xMax;
+            float width = bounds.width;
+
+            if (isHorizontal)
+            {
+                float surfaceY = (boundary != null) ? boundary.SurfaceElevationY : 0.23f;
+                float baseElevation = surfaceY + gizmoElevationOffset;
+                float boxHalfH = gizmoVolumeHeight * 0.5f;
+                float boxCenterY = baseElevation + boxHalfH;
+
+                // 1. Container Floor Line (Darker vivid red)
+                Gizmos.color = new Color(0.95f, 0.12f, 0.12f, 1f);
+                Gizmos.DrawLine(new Vector3(leftX, baseElevation, bottomY), new Vector3(rightX, baseElevation, bottomY));
+                Gizmos.DrawLine(new Vector3(leftX, baseElevation + gizmoVolumeHeight, bottomY), new Vector3(rightX, baseElevation + gizmoVolumeHeight, bottomY));
+
+                // 2. Tolerance Threshold Line (Rich solid gold/amber)
+                Gizmos.color = new Color(1f, 0.72f, 0.0f, 1f);
+                Gizmos.DrawLine(new Vector3(leftX, baseElevation, thresholdY), new Vector3(rightX, baseElevation, thresholdY));
+                Gizmos.DrawLine(new Vector3(leftX, baseElevation + gizmoVolumeHeight, thresholdY), new Vector3(rightX, baseElevation + gizmoVolumeHeight, thresholdY));
+
+                // 3. 3D Volumetric Tolerance Band Area (Amber / Deep Gold with prominent visibility)
+                Vector3 bandCenter = new Vector3((leftX + rightX) * 0.5f, boxCenterY, bottomY + boundaryLayerTolerance * 0.5f);
+                Vector3 bandSize = new Vector3(width, gizmoVolumeHeight, boundaryLayerTolerance);
+
+                Gizmos.color = new Color(1f, 0.72f, 0.0f, 0.38f);
+                Gizmos.DrawCube(bandCenter, bandSize);
+                Gizmos.color = new Color(1f, 0.72f, 0.0f, 0.95f);
+                Gizmos.DrawWireCube(bandCenter, bandSize);
+
+                // 3.5 Floor Exception Margin Safety Catch Zone (Rich Vivid Magenta)
+                float exceptionMargin = (boundary != null) ? boundary.FloorExceptionMargin : 0.8f;
+                float exceptionMarginZ = bottomY - exceptionMargin;
+
+                Gizmos.color = new Color(0.85f, 0.12f, 0.55f, 1f);
+                Gizmos.DrawLine(new Vector3(leftX, baseElevation, exceptionMarginZ), new Vector3(rightX, baseElevation, exceptionMarginZ));
+                Gizmos.DrawLine(new Vector3(leftX, baseElevation + gizmoVolumeHeight, exceptionMarginZ), new Vector3(rightX, baseElevation + gizmoVolumeHeight, exceptionMarginZ));
+
+                Vector3 exceptionCenter = new Vector3((leftX + rightX) * 0.5f, boxCenterY, bottomY - exceptionMargin * 0.5f);
+                Vector3 exceptionSize = new Vector3(width, gizmoVolumeHeight, exceptionMargin);
+
+                Gizmos.color = new Color(0.85f, 0.12f, 0.55f, 0.32f);
+                Gizmos.DrawCube(exceptionCenter, exceptionSize);
+                Gizmos.color = new Color(0.85f, 0.12f, 0.55f, 0.95f);
+                Gizmos.DrawWireCube(exceptionCenter, exceptionSize);
+
+                // 4. Draw Active Bus Column Slices
+                var candidates = GetActiveBusesAtTopOfGrid();
+                if (candidates != null)
+                {
+                    for (int i = 0; i < candidates.Count; i++)
+                    {
+                        var bus = candidates[i];
+                        if (bus == null) continue;
+
+                        if (TryGetBusCollectionRange(bus, out float minX, out float maxX))
+                        {
+                            Color busColor = (palette != null) ? palette.GetColor(bus.ColorId) : Color.cyan;
+                            Vector3 busSliceCenter = new Vector3((minX + maxX) * 0.5f, boxCenterY, bottomY + boundaryLayerTolerance * 0.5f);
+                            Vector3 busSliceSize = new Vector3(maxX - minX, gizmoVolumeHeight * 1.05f, boundaryLayerTolerance);
+
+                            Gizmos.color = new Color(busColor.r, busColor.g, busColor.b, 0.48f);
+                            Gizmos.DrawCube(busSliceCenter, busSliceSize);
+                            Gizmos.color = new Color(busColor.r, busColor.g, busColor.b, 1f);
+                            Gizmos.DrawWireCube(busSliceCenter, busSliceSize);
+
+#if UNITY_EDITOR
+                            var prevSliceZ = UnityEditor.Handles.zTest;
+                            UnityEditor.Handles.zTest = UnityEngine.Rendering.CompareFunction.Always;
+                            GUIStyle sliceStyle = new GUIStyle(UnityEditor.EditorStyles.boldLabel) { normal = { textColor = busColor }, fontSize = 11 };
+                            UnityEditor.Handles.Label(new Vector3(busSliceCenter.x - 0.4f, baseElevation + gizmoVolumeHeight + 0.18f, thresholdY),
+                                $"[{bus.name}] {minX:F1} to {maxX:F1}", sliceStyle);
+                            UnityEditor.Handles.zTest = prevSliceZ;
+#endif
+                        }
+                    }
+                }
+
+#if UNITY_EDITOR
+                var prevHandlesZ = UnityEditor.Handles.zTest;
+                UnityEditor.Handles.zTest = UnityEngine.Rendering.CompareFunction.Always;
+                float labelY = baseElevation + gizmoVolumeHeight + 0.12f;
+
+                GUIStyle labelStyle = new GUIStyle(UnityEditor.EditorStyles.boldLabel) { normal = { textColor = new Color(1f, 0.85f, 0.1f, 1f) }, fontSize = 11 };
+                UnityEditor.Handles.Label(new Vector3(rightX + 0.15f, labelY, thresholdY),
+                    $"Tolerance Line (+{boundaryLayerTolerance:F2})", labelStyle);
+
+                GUIStyle floorStyle = new GUIStyle(UnityEditor.EditorStyles.boldLabel) { normal = { textColor = new Color(1f, 0.25f, 0.25f, 1f) }, fontSize = 11 };
+                UnityEditor.Handles.Label(new Vector3(rightX + 0.15f, labelY, bottomY),
+                    $"Floor (Z: {bottomY:F2})", floorStyle);
+
+                GUIStyle exceptionStyle = new GUIStyle(UnityEditor.EditorStyles.boldLabel) { normal = { textColor = new Color(1f, 0.35f, 0.75f, 1f) }, fontSize = 11 };
+                UnityEditor.Handles.Label(new Vector3(rightX + 0.15f, labelY, exceptionMarginZ),
+                    $"Exception Margin (-{exceptionMargin:F2})", exceptionStyle);
+                UnityEditor.Handles.zTest = prevHandlesZ;
+#endif
+            }
+            else
+            {
+                // Legacy Vertical_XY drawing
+                Gizmos.color = new Color(1f, 0.2f, 0.2f, 0.9f);
+                Gizmos.DrawLine(new Vector3(leftX, bottomY, 0f), new Vector3(rightX, bottomY, 0f));
+
+                Gizmos.color = new Color(1f, 0.92f, 0.016f, 0.95f);
+                Gizmos.DrawLine(new Vector3(leftX, thresholdY, 0f), new Vector3(rightX, thresholdY, 0f));
+
+                Vector3 bandCenter = new Vector3((leftX + rightX) * 0.5f, bottomY + boundaryLayerTolerance * 0.5f, 0f);
+                Vector3 bandSize = new Vector3(width, boundaryLayerTolerance, 0.05f);
+
+                Gizmos.color = new Color(1f, 0.92f, 0.016f, 0.15f);
+                Gizmos.DrawCube(bandCenter, bandSize);
+
+                Gizmos.color = new Color(1f, 0.92f, 0.016f, 0.45f);
+                Gizmos.DrawWireCube(bandCenter, bandSize);
+
+                float exceptionMargin = boundary.FloorExceptionMargin;
+                float exceptionMarginY = bottomY - exceptionMargin;
+
+                Gizmos.color = new Color(0.96f, 0.25f, 0.55f, 0.95f);
+                Gizmos.DrawLine(new Vector3(leftX, exceptionMarginY, 0f), new Vector3(rightX, exceptionMarginY, 0f));
+
+                Vector3 exceptionCenter = new Vector3((leftX + rightX) * 0.5f, bottomY - exceptionMargin * 0.5f, 0f);
+                Vector3 exceptionSize = new Vector3(width, exceptionMargin, 0.05f);
+
+                Gizmos.color = new Color(0.96f, 0.25f, 0.55f, 0.12f);
+                Gizmos.DrawCube(exceptionCenter, exceptionSize);
+
+                Gizmos.color = new Color(0.96f, 0.25f, 0.55f, 0.45f);
+                Gizmos.DrawWireCube(exceptionCenter, exceptionSize);
+
+                var candidates = GetActiveBusesAtTopOfGrid();
+                if (candidates != null)
+                {
+                    for (int i = 0; i < candidates.Count; i++)
+                    {
+                        var bus = candidates[i];
+                        if (bus == null) continue;
+
+                        if (TryGetBusCollectionRange(bus, out float minX, out float maxX))
+                        {
+                            Color busColor = (palette != null) ? palette.GetColor(bus.ColorId) : Color.cyan;
+                            Vector3 busSliceCenter = new Vector3((minX + maxX) * 0.5f, bottomY + boundaryLayerTolerance * 0.5f, 0f);
+                            Vector3 busSliceSize = new Vector3(maxX - minX, boundaryLayerTolerance, 0.15f);
+
+                            Gizmos.color = new Color(busColor.r, busColor.g, busColor.b, 0.35f);
+                            Gizmos.DrawCube(busSliceCenter, busSliceSize);
+
+                            Gizmos.color = busColor;
+                            Gizmos.DrawWireCube(busSliceCenter, busSliceSize);
+
+#if UNITY_EDITOR
+                            UnityEditor.Handles.Label(new Vector3(busSliceCenter.x - 0.4f, thresholdY + 0.15f, 0f),
+                                $"[{bus.name}] {minX:F1} to {maxX:F1}");
+#endif
+                        }
+                    }
+                }
+
+#if UNITY_EDITOR
+                GUIStyle labelStyle = new GUIStyle(UnityEditor.EditorStyles.boldLabel);
+                labelStyle.normal.textColor = Color.yellow;
+                UnityEditor.Handles.Label(new Vector3(rightX + 0.15f, thresholdY, 0f),
+                    $"Tolerance Line (+{boundaryLayerTolerance:F2})", labelStyle);
+
+                GUIStyle floorStyle = new GUIStyle(UnityEditor.EditorStyles.boldLabel);
+                floorStyle.normal.textColor = new Color(1f, 0.35f, 0.35f, 1f);
+                UnityEditor.Handles.Label(new Vector3(rightX + 0.15f, bottomY, 0f),
+                    $"Floor (Y: {bottomY:F2})", floorStyle);
+
+                GUIStyle exceptionStyle = new GUIStyle(UnityEditor.EditorStyles.boldLabel);
+                exceptionStyle.normal.textColor = new Color(0.96f, 0.25f, 0.55f, 1f);
+                UnityEditor.Handles.Label(new Vector3(rightX + 0.15f, exceptionMarginY, 0f),
+                    $"Floor Exception Margin (-{exceptionMargin:F2})", exceptionStyle);
+#endif
+            }
+        }
+#endif
+    }
+}
